@@ -22,5 +22,6 @@ if __name__ == '__main__':
         max_episode_length=100000,
         learning_rate=1e-1,
         lr_decay=1,
-        variable_ep_len=False
+        variable_ep_len=False,
+        cpu_num=4
     )

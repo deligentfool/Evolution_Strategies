@@ -8,24 +8,27 @@ import math
 import os
 
 
-def do_rollouts(model, random_seed, return_queue, env, negative_tag, max_episode_length):
-    episode_return = 0
-    episode_step = 0
-    obs = env.reset()
-    episode_return = 0
-    episode_step = 0
-    for step in range(max_episode_length):
-        obs = torch.FloatTensor(np.expand_dims(obs, 0))
-        output = model.forward(obs)
-        prob = F.softmax(output, -1)
-        action = prob.max(1)[1].detach().item()
-        next_obs, reward, done, info = env.step(action)
-        episode_return += reward
-        episode_step += 1
-        if done:
-            break
-        obs = next_obs
-    return_queue.put([random_seed, episode_return, episode_step, negative_tag])
+def do_rollouts(models, random_seeds, return_queue, env, negative_tags, max_episode_length):
+    all_episode_steps = []
+    all_episode_returns = []
+    for model in models:
+        episode_return = 0
+        episode_step = 0
+        obs = env.reset()
+        for step in range(max_episode_length):
+            obs = torch.FloatTensor(np.expand_dims(obs, 0))
+            output = model.forward(obs)
+            prob = F.softmax(output, -1)
+            action = prob.max(1)[1].detach().item()
+            next_obs, reward, done, info = env.step(action)
+            episode_return += reward
+            episode_step += 1
+            if done:
+                break
+            obs = next_obs
+        all_episode_returns.append(episode_return)
+        all_episode_steps.append(episode_step)
+    return_queue.put([random_seeds, all_episode_returns, all_episode_steps, negative_tags])
 
 
 def perturb_model(model, random_seed, env, sigma):
@@ -100,7 +103,15 @@ def generate_seeds_models(synced_model, env, sigma):
     return random_seed, new_model, anti_model
 
 
-def train(synced_model, env, chkpt_dir, max_gradient_updates, model_num, sigma, max_episode_length, learning_rate, lr_decay, variable_ep_len):
+def split_list(list, num):
+    split_set = []
+    batch_size = int(np.ceil(len(list) / num))
+    for i in range(num):
+        split_set.append(list[i * batch_size: (i + 1) * batch_size])
+    return split_set
+
+
+def train(synced_model, env, chkpt_dir, max_gradient_updates, model_num, sigma, max_episode_length, learning_rate, lr_decay, variable_ep_len, cpu_num):
     episode_num = 0
     total_step_num = 0
     for epoch in range(max_gradient_updates):
@@ -108,58 +119,58 @@ def train(synced_model, env, chkpt_dir, max_gradient_updates, model_num, sigma, 
         return_queue = mp.Queue()
         all_seeds = []
         all_models = []
+        all_negas = []
         for j in range(int(model_num / 2)):
             random_seed, new_model, anti_model = generate_seeds_models(synced_model, env, sigma)
             all_seeds.append(random_seed)
             all_seeds.append(random_seed)
             all_models.extend([new_model, anti_model])
+            all_negas.extend([False, True])
 
-        is_negative = True
-        while all_models:
-            perturbed_model = all_models.pop()
-            seed = all_seeds.pop()
+        all_seeds.append('dummy_seed')
+        all_models.append(synced_model)
+        all_negas.append('dummy_neg')
+
+        seeds_set = split_list(all_seeds, cpu_num)
+        models_set = split_list(all_models, cpu_num)
+        negas_set = split_list(all_negas, cpu_num)
+
+        del all_seeds[:]
+        del all_models[:]
+        del all_negas[:]
+
+        while models_set:
+            perturbed_models = models_set.pop()
+            seeds = seeds_set.pop()
+            negas = negas_set.pop()
             p = mp.Process(
                 target=do_rollouts,
                 args=(
-                    perturbed_model,
-                    seed,
+                    perturbed_models,
+                    seeds,
                     return_queue,
                     env,
-                    is_negative,
+                    negas,
                     max_episode_length
                 )
             )
             p.start()
             processes.append(p)
-            is_negative = not is_negative
 
-        p = mp.Process(
-            target=do_rollouts,
-            args=(
-                synced_model,
-                'dummy_seed',
-                return_queue,
-                env,
-                'dummy_neg',
-                max_episode_length
-            )
-        )
-        p.start()
-        processes.append(p)
         for p in processes:
             p.join()
 
         raw_results = [return_queue.get() for p in processes]
-        random_seeds, all_returns, all_steps, negative_tag = zip(* raw_results)
-        random_seeds = list(random_seeds)
-        all_returns = list(all_returns)
-        all_steps = list(all_steps)
-        negative_tag = list(negative_tag)
+        random_seeds, all_returns, all_steps, negative_tags = zip(* raw_results)
+        random_seeds = [i for batch in random_seeds for i in batch]
+        all_returns = [i for batch in all_returns for i in batch]
+        all_steps = [i for batch in all_steps for i in batch]
+        negative_tags = [i for batch in negative_tags for i in batch]
         unperturbed_index = random_seeds.index('dummy_seed')
         random_seeds.pop(unperturbed_index)
         unperturbed_return = all_returns.pop(unperturbed_index)
         all_steps.pop(unperturbed_index)
-        negative_tag.pop(unperturbed_index)
+        negative_tags.pop(unperturbed_index)
 
         total_step_num += sum(all_steps)
         episode_num += len(all_returns)
@@ -167,7 +178,7 @@ def train(synced_model, env, chkpt_dir, max_gradient_updates, model_num, sigma, 
             synced_model,
             all_returns,
             random_seeds,
-            negative_tag,
+            negative_tags,
             episode_num,
             total_step_num,
             chkpt_dir,
